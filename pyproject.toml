@@ -31,6 +31,7 @@ dependencies = [
     "matplotlib==3.10.9",
     "mdurl==0.1.2",
     "ml-dtypes==0.5.4",
+    "mplfinance>=0.12.10b0",
     "multitasking==0.0.13",
     "namex==0.1.0",
     "numpy==2.4.6",
