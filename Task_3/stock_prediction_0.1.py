@@ -13,7 +13,7 @@ import datetime as dt
 import os
 import tensorflow as tf
 import yfinance as yf
-import mplfinance as mpf  # Task C.3: dedicated library for candlestick charts
+import mplfinance as mpf  # dedicated library for candlestick charts for task C3
 
 from sklearn.preprocessing import MinMaxScaler
 from keras.models import Sequential, load_model
@@ -101,10 +101,8 @@ def load_and_process_dataset(
 #----------------------------------------------------------------
 # Task C.3: Data Visualisation (candlestick + boxplot charts)
 #----------------------------------------------------------------
-# Helper: squash every n_days consecutive trading days into one OHLC(V) row.
-# We group by row position, not by calendar (df.resample('5D')), because data
-# only exists on trading days -> a calendar resample would leave empty weekend
-# gaps. This way each candle is exactly n_days real trading days.
+# Helper: We group by row position, not by calendar (df.resample('5D')), because data
+# only exists on trading days -> a calendar resample would leave empty weekend gaps.
 def _aggregate_n_days(df: pd.DataFrame, n_days: int) -> pd.DataFrame:
     if n_days <= 1:
         return df  # one row already = one candle, nothing to merge
@@ -114,8 +112,6 @@ def _aggregate_n_days(df: pd.DataFrame, n_days: int) -> pd.DataFrame:
     groups = np.arange(len(df)) // n_days
 
     # How to combine each column over the n days:
-    # open -> first day's open, close -> last day's close, high -> max,
-    # low -> min, volume -> total traded.
     agg_rules = {}
     for col in df.columns:
         low = col.lower()
@@ -130,7 +126,7 @@ def _aggregate_n_days(df: pd.DataFrame, n_days: int) -> pd.DataFrame:
         elif low == 'volume':
             agg_rules[col] = 'sum'
         else:
-            agg_rules[col] = 'last'  # fallback for any other column
+            agg_rules[col] = 'last'  # safety fallback for any other column
 
     agg = df.groupby(groups).agg(agg_rules)
 
@@ -141,14 +137,11 @@ def _aggregate_n_days(df: pd.DataFrame, n_days: int) -> pd.DataFrame:
 
 
 # [REQUIREMENT 1] Candlestick chart, with each candle covering n_days (n >= 1).
-# df needs Open/High/Low/Close columns and a date index. show -> also pop up a
-# window; save_path -> where to write the PNG.
+# df needs Open/High/Low/Close columns and a date index. show -> also pop up a window
 def plot_candlestick_chart(
         df: pd.DataFrame,
         n_days: int = 1,
         title: str = 'Candlestick Chart',
-        save_dir: str = 'images',
-        save_path: str | None = None,
         show: bool = True
     ):
     if n_days < 1:
@@ -165,11 +158,7 @@ def plot_candlestick_chart(
     plot_df = _aggregate_n_days(df, n_days)         # no-op when n_days == 1
     has_volume = 'Volume' in plot_df.columns        # only show volume if we have it
 
-    os.makedirs(save_dir, exist_ok=True)
-    if save_path is None:
-        save_path = os.path.join(save_dir, f'candlestick_{n_days}day.png')
-
-    chart_title = title  # caller sets the full title, e.g. "NVDA 20-Day Candles"
+    chart_title = title  # e.g. "NVDA 20-Day Candles"
 
     # mpf.plot arguments:
     #   type='candle' -> candlestick (others: 'ohlc', 'line')
@@ -177,27 +166,22 @@ def plot_candlestick_chart(
     #   volume -> add a volume bar panel underneath
     #   savefig -> save straight to a PNG (the "store as image" requirement)
     mpf.plot(plot_df, type='candle', style='charles', volume=has_volume,
-             title=chart_title, ylabel='Price', savefig=save_path)
-    print(f"Saved candlestick chart to {save_path}")
-
+             title=chart_title, ylabel='Price')
+    
     if show:
-        # savefig writes to file instead of the screen, so draw it again to view.
-        mpf.plot(plot_df, type='candle', style='charles', volume=has_volume,
-                 title=chart_title, ylabel='Price')
+        plt.show()
 
 
 # [REQUIREMENT 2] Boxplot chart over a moving window of n_days trading days.
 # Each box shows the spread (median, quartiles, whiskers, outliers) of `column`
-# in one window. step = how far the window moves each time: step == n_days gives
-# back-to-back windows, step == 1 gives a true sliding window (lots of overlap).
+# in one window.
+# step == 1 gives a true sliding window (lots of overlap).
 def plot_boxplot_chart(
         df: pd.DataFrame,
         column: str = 'Close',
         n_days: int = 20,
         step: int | None = None,
         title: str = 'Boxplot Chart',
-        save_dir: str = 'images',
-        save_path: str | None = None,
         show: bool = True
     ):
     if column not in df.columns:
@@ -209,8 +193,7 @@ def plot_boxplot_chart(
 
     series = df[column]
 
-    # One window (= one box) per slide. Stop at len - n_days so the last window
-    # is still full length.
+    # One window (= one box) per slide. Stop at len - n_days so the last window is still full length.
     windows = []      # the n_days values for each box
     labels = []       # x label = the last date in each window
     for start in range(0, len(series) - n_days + 1, step):
@@ -221,21 +204,14 @@ def plot_boxplot_chart(
     if not windows:
         raise ValueError(f"Not enough rows ({len(series)}) for an {n_days}-day window.")
 
-    os.makedirs(save_dir, exist_ok=True)
-    if save_path is None:
-        save_path = os.path.join(save_dir, f'boxplot_{column}_{n_days}day.png')
-
-    # Make the figure wider when there are more boxes so labels stay readable.
+    # Make the figure wider for readable.
     fig, ax = plt.subplots(figsize=(max(8, len(windows) * 0.4), 6))
     ax.boxplot(windows, labels=labels)              # one box per window
     ax.set_title(f'{title}: {column} over {n_days}-day windows (step={step})')
     ax.set_xlabel(f'Window end date (each box = {n_days} trading days)')
     ax.set_ylabel(column)
-    plt.setp(ax.get_xticklabels(), rotation=90, fontsize=8)  # rotate the date labels
+    plt.setp(ax.get_xticklabels(), rotation=90, fontsize=8)
     fig.tight_layout()
-
-    fig.savefig(save_path)                          # store the visualisation as an image
-    print(f"Saved boxplot chart to {save_path}")
 
     if show:
         plt.show()
@@ -243,7 +219,7 @@ def plot_boxplot_chart(
         plt.close(fig)
 
 
-# --- small helpers so the user can pick what to plot at runtime ---
+# Runtime Input Helper functions
 def _ask_int(prompt: str, default: int) -> int:
     # Keep asking until we get a whole number >= 1 (blank uses the default).
     while True:
@@ -256,7 +232,7 @@ def _ask_int(prompt: str, default: int) -> int:
                 return value
         except ValueError:
             pass
-        print("  Please enter a whole number >= 1.")
+        print("Please enter a whole number >= 1.")
 
 
 def _ask_date(prompt: str, is_end: bool):
@@ -272,7 +248,7 @@ def _ask_date(prompt: str, is_end: bool):
             period = pd.Period(raw)
             return period.end_time if is_end else period.start_time
         except ValueError:
-            print("  Use a year (2021), year-month (2021-03) or date (2021-03-15).")
+            print("Use a year (2021), year-month (2021-03) or date (2021-03-15).")
 
 
 def _slice_range(df: pd.DataFrame, start, end) -> pd.DataFrame:
@@ -313,7 +289,8 @@ data = train_data
 #----------------------------------------------------------------
 # Task C.3: Visualise the data (the user chooses what to plot)
 #----------------------------------------------------------------
-# train_data still holds raw OHLC prices here (scale_columns was False above).
+# The limit range is the var "data" above after ran load_and_process_dataset()
+# Which means the date range is TRAIN_START to TEST_START - 1
 print("\n--- Task C.3: chart options (press Enter to accept the [default]) ---")
 n_days = _ask_int("Days per candle / box window (n) [1]: ", default=1)
 start = _ask_date("Start date - year / year-month / date [all data]: ", is_end=False)
