@@ -12,11 +12,14 @@
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-from data_loader   import load_and_process_dataset, prepare_lstm_data
+from data_loader   import load_and_process_dataset, prepare_lstm_data, prepare_sequences
 from visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
-                           plot_predictions, ask_int, ask_date, slice_range)
+                           plot_predictions, plot_multistep_forecast,
+                           ask_int, ask_date, slice_range)
 from model_builder import build_model, get_model_path, load_or_build
-from predictor     import build_test_inputs, make_predictions, predict_next_day
+from predictor     import (build_test_inputs, make_predictions, predict_next_day,
+                           build_test_inputs_mv, make_windows, inverse_close,
+                           forecast_future)
 
 
 COMPANY     = 'NVDA'
@@ -42,8 +45,10 @@ DROPOUT_RATE = 0.2
 EPOCHS     = 20
 BATCH_SIZE = 32
 
-# Retrain even when the model existed
-FORCE_RETRAIN = True
+# Retrain even when a saved model exists.
+# False -> reuse cached models (fast); each model caches per config via its tag,
+# so changing k or the architecture trains a fresh one automatically.
+FORCE_RETRAIN = False
 
 
 # ==============================
@@ -189,3 +194,91 @@ print(f"\n[main] Next-day predicted closing price for {COMPANY}: ${next_day_pric
 # big_path   = get_model_path(MODEL_DIR, COMPANY, tag='LSTM_256x128x64')
 # big_model  = load_or_build(big_path, big_kwargs, x_train, y_train,
 #                            epochs=50, batch_size=16, force_retrain=False)
+
+
+# ==============================
+# Task C.5 — Machine Learning 2: multivariate & multistep prediction
+#
+# Three scenarios, each built from the SAME generalised functions:
+#   prepare_sequences()  – windows with n_features inputs and k_steps targets
+#   build_model()        – n_features sets the Input width, dense_units = k
+#   forecast_future()    – k future closes from one window (inverse-scaled)
+# ==============================
+FEATURES   = ['Open', 'High', 'Low', 'Close', 'Volume']   # multivariate inputs
+TARGET_COL = 'Close'                                       # what we predict
+
+print("\n─── Task C.5: multistep / multivariate prediction ───")
+K_STEPS = ask_int("Forecast horizon k (days into the future) [5]: ", default=5)
+
+# Re-load the SAME data scaled per-column (the CSV cache makes this near-free).
+# Returns scaled train/test frames + a {column: fitted MinMaxScaler} dict; each
+# scaler is fitted on training data only, so there is no test-set leakage.
+train_scaled, test_scaled, scalers = load_and_process_dataset(
+    company      = COMPANY,
+    start_date   = TRAIN_START,
+    end_date     = TEST_END,
+    features     = FEATURES,
+    data_dir     = DATA_DIR,
+    force_download = False,
+    nan_method   = 'forward_fill',
+    split_method = 'date',
+    split_param  = TEST_START,
+    scale_columns = True,
+)
+target_idx     = FEATURES.index(TARGET_COL)
+close_scaler   = scalers[TARGET_COL]
+train_features = train_scaled[FEATURES].values        # scaled (rows, n_features)
+train_close    = train_scaled[[TARGET_COL]].values    # scaled (rows, 1)
+recent_close   = train_data[PRICE_VALUE].values[-PREDICTION_DAYS:]   # raw, for plots
+
+
+# ── [C.5-1] Multistep: univariate Close → next k closes ──────────────────────
+X1, y1 = prepare_sequences(train_close, target_idx=0,
+                           prediction_days=PREDICTION_DAYS, k_steps=K_STEPS)
+model_multistep = load_or_build(
+    model_path   = get_model_path(MODEL_DIR, COMPANY, tag=f'multistep_k{K_STEPS}'),
+    build_kwargs = dict(sequence_length=PREDICTION_DAYS, layer_sizes=LAYER_SIZES,
+                        layer_type=DL_NETWORK, dropout_rate=DROPOUT_RATE,
+                        dense_units=K_STEPS, n_features=1),
+    x_train=X1, y_train=y1, epochs=EPOCHS, batch_size=BATCH_SIZE,
+    force_retrain=FORCE_RETRAIN,
+)
+forecast_1 = forecast_future(model_multistep, train_close[-PREDICTION_DAYS:],
+                             close_scaler, K_STEPS)
+print(f"[C.5-1] Multistep {K_STEPS}-day Close forecast (USD): {np.round(forecast_1, 2)}")
+plot_multistep_forecast(recent_close, forecast_1, COMPANY)
+
+
+# ── [C.5-2] Multivariate: OHLCV → next-day Close ─────────────────────────────
+X2, y2 = prepare_sequences(train_features, target_idx=target_idx,
+                           prediction_days=PREDICTION_DAYS, k_steps=1)
+model_multivariate = load_or_build(
+    model_path   = get_model_path(MODEL_DIR, COMPANY, tag='multivariate'),
+    build_kwargs = dict(sequence_length=PREDICTION_DAYS, layer_sizes=LAYER_SIZES,
+                        layer_type=DL_NETWORK, dropout_rate=DROPOUT_RATE,
+                        dense_units=1, n_features=len(FEATURES)),
+    x_train=X2, y_train=y2, epochs=EPOCHS, batch_size=BATCH_SIZE,
+    force_retrain=FORCE_RETRAIN,
+)
+# Evaluate across the whole test period using multivariate look-back windows.
+mv_inputs   = build_test_inputs_mv(train_data, test_data, FEATURES, scalers, PREDICTION_DAYS)
+x_test_mv   = make_windows(mv_inputs, PREDICTION_DAYS)
+predicted_mv = inverse_close(model_multivariate.predict(x_test_mv), close_scaler)
+plot_predictions(test_data[TARGET_COL].values, predicted_mv, COMPANY)
+
+
+# ── [C.5-3] Combined: multivariate OHLCV → next k closes ─────────────────────
+X3, y3 = prepare_sequences(train_features, target_idx=target_idx,
+                           prediction_days=PREDICTION_DAYS, k_steps=K_STEPS)
+model_combined = load_or_build(
+    model_path   = get_model_path(MODEL_DIR, COMPANY, tag=f'mv_multistep_k{K_STEPS}'),
+    build_kwargs = dict(sequence_length=PREDICTION_DAYS, layer_sizes=LAYER_SIZES,
+                        layer_type=DL_NETWORK, dropout_rate=DROPOUT_RATE,
+                        dense_units=K_STEPS, n_features=len(FEATURES)),
+    x_train=X3, y_train=y3, epochs=EPOCHS, batch_size=BATCH_SIZE,
+    force_retrain=FORCE_RETRAIN,
+)
+forecast_3 = forecast_future(model_combined, train_features[-PREDICTION_DAYS:],
+                             close_scaler, K_STEPS)
+print(f"[C.5-3] Multivariate {K_STEPS}-day Close forecast (USD): {np.round(forecast_3, 2)}")
+plot_multistep_forecast(recent_close, forecast_3, COMPANY)

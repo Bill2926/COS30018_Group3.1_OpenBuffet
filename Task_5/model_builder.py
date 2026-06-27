@@ -31,6 +31,7 @@ def build_model(
         layer_type: str = 'LSTM',
         dropout_rate: float = 0.2,
         dense_units: int = 1,
+        n_features: int = 1,
         optimizer: str = 'adam',
         loss: str = 'mean_squared_error'
     ):
@@ -67,7 +68,12 @@ def build_model(
 
     dense_units : int
         Width of the final Dense output layer.  For single-step price
-        prediction this is 1; for multi-step it would be > 1.
+        prediction this is 1; for multistep prediction it is k (Task C.5).
+
+    n_features : int
+        Number of input feature time-series per timestep (Task C.5).
+        1 for univariate (Close only); len(OHLCV) for the multivariate problem.
+        Sets the last dimension of the Input shape.
 
     optimizer : str
         Keras optimiser name, e.g. 'adam', 'rmsprop', 'sgd'.
@@ -112,10 +118,12 @@ def build_model(
     # ── Build the Sequential graph ────────────────────────────────────────────
     model = Sequential()
 
-    # Input layer: explicitly declares the shape (sequence_length, 1 feature).
-    # Using keras.layers.Input avoids the deprecation warning that arises when
-    # input_shape is passed directly to the first recurrent layer in newer Keras.
-    model.add(Input(shape=(sequence_length, 1)))
+    # Input layer: explicitly declares the shape (sequence_length, n_features).
+    # n_features=1 is the univariate case; >1 feeds several feature series at each
+    # timestep (the multivariate problem). Using keras.layers.Input avoids the
+    # deprecation warning that arises when input_shape is passed directly to the
+    # first recurrent layer in newer Keras.
+    model.add(Input(shape=(sequence_length, n_features)))
 
     # ── Recurrent layers ──────────────────────────────────────────────────────
     n_layers = len(layer_sizes)

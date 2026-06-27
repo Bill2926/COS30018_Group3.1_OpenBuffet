@@ -155,6 +155,41 @@ def plot_predictions(
         plt.show()
 
 
+def plot_multistep_forecast(
+        history: np.ndarray,
+        forecast: np.ndarray,
+        company: str,
+        show: bool = True
+    ):
+    """
+    Plot the recent actual closing prices followed by the k-step forecast that
+    extends past the end of the history (Task C.5 multistep).
+
+    history  : 1-D array of recent actual closing prices (USD).
+    forecast : 1-D array of the next k predicted closing prices (USD).
+    """
+    history  = np.asarray(history).flatten()
+    forecast = np.asarray(forecast).flatten()
+
+    # x-positions: history occupies [0 .. len(history)-1]; the forecast continues
+    # straight after it. We repeat the last history point so the two lines join.
+    hist_x = np.arange(len(history))
+    fc_x   = np.arange(len(history) - 1, len(history) + len(forecast))
+    fc_y   = np.concatenate([history[-1:], forecast])
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(hist_x, history, color='black', label=f'Recent actual {company} Close')
+    plt.plot(fc_x, fc_y, color='red', marker='o',
+             label=f'{len(forecast)}-day forecast')
+    plt.title(f'{company} — {len(forecast)}-Day Closing Price Forecast')
+    plt.xlabel('Trading Days')
+    plt.ylabel('Price (USD)')
+    plt.legend()
+    plt.tight_layout()
+    if show:
+        plt.show()
+
+
 # ── CLI helpers ──────────────────────────────────────────────────────────────
 
 def ask_int(prompt: str, default: int) -> int:

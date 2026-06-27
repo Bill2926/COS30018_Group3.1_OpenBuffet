@@ -140,3 +140,42 @@ def prepare_lstm_data(series: np.ndarray, prediction_days: int):
     # Reshape X to (samples, timesteps, features=1) as required by Keras RNN layers.
     X = X.reshape(X.shape[0], X.shape[1], 1)
     return X, y
+
+
+def prepare_sequences(data: np.ndarray, target_idx: int,
+                      prediction_days: int, k_steps: int = 1):
+    """
+    Build supervised windows for the multivariate and/or multistep problems (Task C.5).
+
+    This generalises prepare_lstm_data() along two axes at once:
+      * multivariate : `data` may have several feature columns, all of which go
+                       into each input window.
+      * multistep    : each target is the next `k_steps` values of the target
+                       column (not just the single next value).
+
+    Parameters
+    ----------
+    data            : 2-D array of shape (n_rows, n_features) of SCALED values.
+    target_idx      : Column index of the feature we predict (e.g. Close).
+    prediction_days : Look-back window length (timesteps fed to the model).
+    k_steps         : How many future steps to predict (k >= 1).
+
+    Returns
+    -------
+    X : np.ndarray (n_samples, prediction_days, n_features) — input windows.
+    y : np.ndarray (n_samples, k_steps)                     — next k target values.
+
+    Note: with a single feature column and k_steps=1 this reduces to the same
+    pairs as prepare_lstm_data (only y is 2-D here, shape (n_samples, 1)).
+    """
+    if data.ndim != 2:
+        raise ValueError("data must be 2-D (n_rows, n_features).")
+    if k_steps < 1:
+        raise ValueError("k_steps must be >= 1.")
+
+    X, y = [], []
+    # Stop k_steps early so every window has a full k-length target ahead of it.
+    for i in range(prediction_days, len(data) - k_steps + 1):
+        X.append(data[i - prediction_days:i, :])        # look-back, all features
+        y.append(data[i:i + k_steps, target_idx])       # next k target values
+    return np.array(X), np.array(y)
