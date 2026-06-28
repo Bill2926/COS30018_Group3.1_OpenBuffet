@@ -1,6 +1,6 @@
 # File: main.py
 # Authors: Bao Vo, Cheong Koo (original);\
-# Version: v0.3 - Task C4
+# Version: v0.4 - Task C5
 #
 # This is the the Entry Point.
 # All logic lives in the four modules:
@@ -168,32 +168,6 @@ plot_predictions(actual_prices, predicted_prices, COMPANY)
 # ==============================
 next_day_price = predict_next_day(model, model_inputs, PREDICTION_DAYS, scaler)
 print(f"\n[main] Next-day predicted closing price for {COMPANY}: ${next_day_price:.2f}")
-
-
-# ==============================
-# Task C.4 Experiment block
-# ==============================
-# Uncomment any experiment below to compare architectures.
-# Each call to build_model() demonstrates that the function works for any
-# combination of DL_NETWORK × layer_sizes × hyperparameters.
-
-# ── Experiment A: GRU, same depth as baseline ────────────────────────────
-# gru_kwargs = {**build_kwargs, 'DL_NETWORK': 'GRU'}
-# gru_path   = get_model_path(MODEL_DIR, COMPANY, tag='GRU_128x64x32')
-# gru_model  = load_or_build(gru_path, gru_kwargs, x_train, y_train,
-#                            epochs=25, batch_size=32, force_retrain=False)
-
-# ── Experiment B: SimpleRNN, shallow ────────────────────────────────────
-# rnn_kwargs = {**build_kwargs, 'DL_NETWORK': 'RNN', 'layer_sizes': [64, 32]}
-# rnn_path   = get_model_path(MODEL_DIR, COMPANY, tag='RNN_64x32')
-# rnn_model  = load_or_build(rnn_path, rnn_kwargs, x_train, y_train,
-#                            epochs=25, batch_size=32, force_retrain=False)
-
-# ── Experiment C: LSTM, wider layers, higher dropout ─────────────────────
-# big_kwargs = {**build_kwargs, 'layer_sizes': [256, 128, 64], 'dropout_rate': 0.3}
-# big_path   = get_model_path(MODEL_DIR, COMPANY, tag='LSTM_256x128x64')
-# big_model  = load_or_build(big_path, big_kwargs, x_train, y_train,
-#                            epochs=50, batch_size=16, force_retrain=False)
 
 
 # ==============================
