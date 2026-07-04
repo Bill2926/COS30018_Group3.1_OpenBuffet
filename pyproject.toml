@@ -57,6 +57,7 @@ dependencies = [
     "setuptools==82.0.1",
     "six==1.17.0",
     "soupsieve==2.8.4",
+    "statsmodels>=0.14.6",
     "tensorboard>=2.20.0",
     "tensorflow==2.21.0",
     "termcolor==3.3.0",

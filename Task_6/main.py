@@ -11,7 +11,8 @@
 
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
-
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.ensemble import RandomForestRegressor
 from data_loader   import load_and_process_dataset, prepare_lstm_data, prepare_sequences
 from visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
                            plot_predictions, plot_multistep_forecast,
@@ -256,3 +257,62 @@ forecast_3 = forecast_future(model_combined, train_features[-PREDICTION_DAYS:],
                              close_scaler, K_STEPS)
 print(f"[C.5-3] Multivariate {K_STEPS}-day Close forecast (USD): {np.round(forecast_3, 2)}")
 plot_multistep_forecast(recent_close, forecast_3, COMPANY)
+
+# ==============================
+# Task C.6: Machine Learning 3 - Ensemble Learning Options
+# ==============================
+print("\n─── Task C.6: Thong so Ensemble ───")
+print("Chon phuong phap Machine Learning de ket hop voi", DL_NETWORK, ":")
+print("1. ARIMA")
+print("2. Random Forest")
+
+# Cho user chon phuong phap
+user_choice = input("Nhap lua chon cua ban (1 hoac 2) [1]: ").strip()
+if user_choice not in ['1', '2']:
+    user_choice = '1'
+
+# Thiet lap trong so cho viec ket hop ket qua (Weighted Average)
+weight_ml = 0.4
+weight_dl = 0.6
+predicted_dl_flat = predicted_prices.flatten()
+
+if user_choice == '1':
+    print(f"\n[C.6] Dang huan luyen ARIMA ket hop voi {DL_NETWORK}...")
+    
+    # Lay du lieu 1D cho ARIMA
+    train_prices_1d = train_data[PRICE_VALUE].values
+    
+    # Huan luyen ARIMA
+    arima_model = ARIMA(train_prices_1d, order=(5, 1, 0))
+    arima_fit = arima_model.fit()
+    
+    # Du doan tren tap test
+    ml_predictions = arima_fit.forecast(steps=len(test_data))
+    method_name = "ARIMA"
+
+else:
+    print(f"\n[C.6] Dang huan luyen Random Forest ket hop voi {DL_NETWORK}...")
+    
+    # Reshape du lieu 3D (samples, timesteps, features) thanh 2D cho Random Forest
+    x_train_rf = x_train.reshape(x_train.shape[0], -1)
+    x_test_rf = x_test.reshape(x_test.shape[0], -1)
+    
+    # Huan luyen Random Forest
+    rf_model = RandomForestRegressor(n_estimators=150, max_depth=10, random_state=42)
+    rf_model.fit(x_train_rf, y_train)
+    
+    # Du doan va giai chuan hoa (inverse transform)
+    rf_pred_scaled = rf_model.predict(x_test_rf).reshape(-1, 1)
+    ml_predictions = scaler.inverse_transform(rf_pred_scaled).flatten()
+    method_name = "Random Forest"
+
+# Tinh toan ket qua Ensemble cuoi cung
+ensemble_predicted_prices = (weight_ml * ml_predictions) + (weight_dl * predicted_dl_flat)
+
+# Truc quan hoa
+print(f"[C.6] Ve bieu do so sanh ket qua Ensemble...")
+plot_predictions(
+    actual_prices, 
+    ensemble_predicted_prices, 
+    f"{COMPANY} (Ensemble {method_name} + {DL_NETWORK})"
+)
