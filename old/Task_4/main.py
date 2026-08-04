@@ -12,11 +12,11 @@
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 
-from data_loader   import load_and_process_dataset, prepare_lstm_data
-from visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
+from old.Task_4.data_loader   import load_and_process_dataset, prepare_lstm_data
+from old.Task_4.visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
                            plot_predictions, ask_int, ask_date, slice_range)
-from model_builder import build_model, get_model_path, load_or_build
-from predictor     import build_test_inputs, make_predictions, predict_next_day
+from old.Task_4.model_builder import build_model, get_model_path, load_or_build
+from old.Task_4.predictor     import build_test_inputs, make_predictions, predict_next_day
 
 
 COMPANY     = 'NVDA'

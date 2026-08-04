@@ -13,12 +13,12 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.ensemble import RandomForestRegressor
-from data_loader   import load_and_process_dataset, prepare_lstm_data, prepare_sequences
-from visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
+from old.Task_6.data_loader   import load_and_process_dataset, prepare_lstm_data, prepare_sequences
+from old.Task_6.visualiser    import (plot_candlestick_chart, plot_boxplot_chart,
                            plot_predictions, plot_multistep_forecast,
                            ask_int, ask_date, slice_range)
-from model_builder import build_model, get_model_path, load_or_build
-from predictor     import (build_test_inputs, make_predictions, predict_next_day,
+from old.Task_6.model_builder import build_model, get_model_path, load_or_build
+from old.Task_6.predictor     import (build_test_inputs, make_predictions, predict_next_day,
                            build_test_inputs_mv, make_windows, inverse_close,
                            forecast_future)
 
