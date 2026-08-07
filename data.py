@@ -1,12 +1,4 @@
-# File: data_handler.py
-# Two classes, split by responsibility:
-#   DataDownloader - pulls stock data from yfinance for a chosen ticker/timeframe
-#                     and caches it to cache/ as CSV (the only network-facing piece).
-#   DataHandler     - takes that CSV, cleans it (NaN / weekend-holiday gaps),
-#                     scales it, splits into train/test, and windows each split
-#                     into (X, y) sequences for the model (single or multi-step,
-#                     single or multi-variate, or both at once).
-
+# File: data.py
 import os
 import numpy as np
 import pandas as pd
@@ -14,19 +6,30 @@ import yfinance as yf
 from datetime import datetime, timedelta
 from sklearn.preprocessing import MinMaxScaler
 
+# ── Module Level Configuration / Flags ────────────
+INCLUDE_QQQ_CROSS_ASSET: bool = True  # Toggle QQQ feature integration
+PREDICT_CROSS_ASSET: bool = True  # Toggle also predicting the cross-asset's own price (e.g. QQQ), on top of the primary target
+DEFAULT_CROSS_ASSET_TICKER: str = "QQQ"
+
 
 class DataDownloader:
-    """
-    Pulls a ticker's OHLCV data from yfinance for a chosen timeframe and
-    caches it to disk as CSV so repeated runs don't re-hit the network.
+    """Pulls stock OHLCV data from yfinance for one or multiple tickers and
 
-    Timeframe: explicit start/end date, or default = last 3 years from today.
-    end_date can never go beyond today.
+    caches them locally as CSV files.
     """
 
-    def __init__(self, ticker: str, start_date: str | None = None,
-                 end_date: str | None = None, cache_dir: str = "cache"):
-        self.ticker = ticker
+    def __init__(
+        self,
+        tickers: str | list[str],
+        start_date: str | None = None,
+        end_date: str | None = None,
+        cache_dir: str = "cache",
+    ):
+        if isinstance(tickers, str):
+            self.tickers = [tickers]
+        else:
+            self.tickers = tickers
+
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -49,158 +52,237 @@ class DataDownloader:
         self.start_date = start_dt.strftime("%Y-%m-%d")
         self.end_date = end_dt.strftime("%Y-%m-%d")
 
-    def _cache_path(self) -> str:
+    def _cache_path(self, ticker: str) -> str:
         return os.path.join(
-            self.cache_dir, f"{self.ticker}_{self.start_date}_{self.end_date}.csv"
+            self.cache_dir, f"{ticker}_{self.start_date}_{self.end_date}.csv"
         )
 
-    def download(self, force_download: bool = False) -> str:
-        """
-        Fetch data from yfinance, or reuse the cached CSV if it already exists.
-        Returns the path to the CSV (downloaded or cached) for DataHandler to consume.
-        """
-        cache_path = self._cache_path()
+    def download_ticker(
+        self, ticker: str, force_download: bool = False
+    ) -> str:
+        """Download or reuse cached CSV for a single ticker."""
+        cache_path = self._cache_path(ticker)
 
         if os.path.exists(cache_path) and not force_download:
-            print(f"[DataDownloader] Using cached data at {cache_path} ...")
+            print(f"[DataDownloader] Using cached data for {ticker} at {cache_path} ...")
             return cache_path
 
-        print(f"[DataDownloader] Downloading {self.ticker} from Yahoo Finance "
-              f"({self.start_date} -> {self.end_date}) ...")
-        df = yf.download(self.ticker, start=self.start_date, end=self.end_date,
-                          auto_adjust=True)
+        print(
+            f"[DataDownloader] Downloading {ticker} from Yahoo Finance "
+            f"({self.start_date} -> {self.end_date}) ..."
+        )
+        df = yf.download(
+            ticker, start=self.start_date, end=self.end_date, auto_adjust=True
+        )
         if df is None or df.empty:
-            raise ValueError(f"No data returned for ticker '{self.ticker}'.")
+            raise ValueError(f"No data returned for ticker '{ticker}'.")
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df.to_csv(cache_path)
         return cache_path
 
+    def download(self, force_download: bool = False) -> str | dict[str, str]:
+        """Download all tickers.
+        If single ticker, returns str. If list of tickers, returns dict {ticker:
+        csv_path}.
+        """
+        paths = {}
+        for t in self.tickers:
+            paths[t] = self.download_ticker(t, force_download=force_download)
+
+        if len(self.tickers) == 1:
+            return paths[self.tickers[0]]
+        return paths
+
 
 class DataHandler:
     """
-    Feature-engineers a CSV of raw OHLCV data into model-ready train/test sets.
-
-    Pipeline: load -> clean (NaN + weekend/holiday gaps) -> split -> scale
-    (fit on train only, to avoid leakage) -> window into (X, y) sequences.
-
-    Windowing supports:
-      - multivariate  : feature_columns has more than one column.
-      - multi-step (k): predict k future values of target_column instead of 1.
-      - hybrid        : both of the above at once.
+    Feature-engineers OHLCV data from single or multiple stock CSVs into model-ready train/test sets.
     """
 
-    def __init__(self, csv_path: str, feature_columns: list[str] | None = None,
-                 target_column: str = "Close"):
-        self.csv_path = csv_path
-        self.feature_columns = feature_columns  # None -> resolved to all columns on load
+    def __init__(
+        self,
+        csv_input: str | dict[str, str],
+        target_ticker: str = "AAPL",
+        feature_columns: list[str] | None = None,
+        target_column: str | list[str] | None = None,
+        include_cross_asset: bool = INCLUDE_QQQ_CROSS_ASSET,
+        predict_cross_asset: bool = PREDICT_CROSS_ASSET,
+    ):
+        """Parameters:
+
+        csv_input: Single CSV path string OR dictionary of {ticker: csv_path}.
+        target_ticker: Primary ticker whose close price is targeted for
+        prediction. include_cross_asset: Flag to toggle cross-asset features.
+        predict_cross_asset: Flag to also predict the cross-asset ticker(s)'
+        own next-day log return (multi-target output), on top of the primary
+        target_ticker. Only takes effect when include_cross_asset is True and
+        more than one ticker is loaded; ignored otherwise.
+        """
+        if isinstance(csv_input, str):
+            self.csv_map = {target_ticker: csv_input}
+        else:
+            self.csv_map = csv_input
+
+        self.target_ticker = target_ticker
+        self.include_cross_asset = include_cross_asset
+        self.predict_cross_asset = predict_cross_asset
+        self.feature_columns = feature_columns
         self.target_column = target_column
 
-        self.raw_df: pd.DataFrame | None = None
+        self.raw_df_map: dict[str, pd.DataFrame] = {}
         self.clean_df: pd.DataFrame | None = None
         self.scalers: dict = {}
-        self.raw_close_test: np.ndarray | None = None
+        self.raw_close_test: np.ndarray | None = None  # primary target_ticker's raw close (backward-compat)
+        self.raw_close_test_map: dict[str, np.ndarray] = {}  # ticker -> raw close, for every predicted ticker
+        self.target_tickers: list[str] = [target_ticker]  # ticker each column of target_column corresponds to, in order
 
-    def load(self) -> pd.DataFrame:
-        """Read the CSV produced by DataDownloader into a DatetimeIndex-ed DataFrame."""
-        df = pd.read_csv(self.csv_path, index_col=0, parse_dates=True)
-        self.raw_df = df
-        if self.feature_columns is None:
-            self.feature_columns = list(df.columns)
-        return df
+    def load(self) -> dict[str, pd.DataFrame]:
+        """Load raw CSVs for all configured tickers into DataFrames."""
+        for ticker, path in self.csv_map.items():
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+            self.raw_df_map[ticker] = df
+        return self.raw_df_map
 
-    def clean(self, nan_method: str = "forward_fill", fill_gaps: bool = True) -> pd.DataFrame:
-        """
-        Reindex over the full business-day calendar (exposing weekend/holiday
-        gaps as NaN) and fill NaNs. fill_gaps=False skips the reindex step.
-        """
-        if self.raw_df is None:
+    def clean(
+        self, nan_method: str = "forward_fill", fill_gaps: bool = True
+    ) -> pd.DataFrame:
+        """Clean each ticker's DataFrame and inner-join them on DatetimeIndex."""
+        if not self.raw_df_map:
             self.load()
 
-        df = self.raw_df.copy()
+        cleaned_dfs = []
+        for ticker, raw_df in self.raw_df_map.items():
+            df = raw_df.copy()
 
-        if fill_gaps:
-            full_range = pd.bdate_range(df.index.min(), df.index.max())
-            df = df.reindex(full_range)
+            if fill_gaps:
+                full_range = pd.bdate_range(df.index.min(), df.index.max())
+                df = df.reindex(full_range)
 
-        if nan_method == "forward_fill":
-            df = df.ffill()
-        elif nan_method == "drop":
-            df = df.dropna()
-        elif nan_method == "mean":
-            df = df.fillna(df.mean())
-        df = df.bfill()  # safety back-fill for any leading NaNs
+            if nan_method == "forward_fill":
+                df = df.ffill()
+            elif nan_method == "drop":
+                df = df.dropna()
+            elif nan_method == "mean":
+                df = df.fillna(df.mean())
+            df = df.bfill()
 
-        self.clean_df = df
-        return df
+            # Add prefix if multiple tickers are being loaded
+            if len(self.raw_df_map) > 1 or self.include_cross_asset:
+                df = df.add_prefix(f"{ticker}_")
 
-    def _compute_target_log_return(self, df: pd.DataFrame) -> pd.Series:
-        """
-        Next-day target log return: y_t = log(C_{t+1} / C_t) = log(C_{t+1}) - log(C_t).
+            cleaned_dfs.append(df)
 
-        Aligned to row t so it can be windowed like any other column: by the
-        time X's window ends at row t, everything needed to know y_t (the
-        move from t to t+1) is still in the future, so it's a valid target,
-        not a leaked feature.
-        """
-        close = df["Close"]
-        target = pd.Series(np.log(close.shift(-1) / close), index=df.index, name="Target_Log_Return")
-        return target
+        # Inner join to keep overlapping trading dates across assets
+        if len(cleaned_dfs) == 1:
+            merged_df = cleaned_dfs[0]
+        else:
+            merged_df = pd.concat(cleaned_dfs, axis=1, join="inner")
 
-    def _compute_intraday_log_ratios(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Log ratios of Open/High/Low relative to Close, same-day (no leakage: all four are known together at close)."""
+        self.clean_df = merged_df
+        return merged_df
+
+    def _compute_ticker_features(
+        self, df: pd.DataFrame, prefix: str = ""
+    ) -> pd.DataFrame:
+        """Compute log features for a specific ticker's OHLCV columns."""
+        c_col = f"{prefix}Close"
+        o_col = f"{prefix}Open"
+        h_col = f"{prefix}High"
+        l_col = f"{prefix}Low"
+        v_col = f"{prefix}Volume"
+
         out = pd.DataFrame(index=df.index)
-        out["Open_Close"] = np.log(df["Open"] / df["Close"])
-        out["High_Close"] = np.log(df["High"] / df["Close"])
-        out["Low_Close"] = np.log(df["Low"] / df["Close"])
+        out[f"{prefix}Log_Return"] = np.log(df[c_col] / df[c_col].shift(1))
+        out[f"{prefix}Open_Close"] = np.log(df[o_col] / df[c_col])
+        out[f"{prefix}High_Close"] = np.log(df[h_col] / df[c_col])
+        out[f"{prefix}Low_Close"] = np.log(df[l_col] / df[c_col])
+        out[f"{prefix}Vol_Change"] = np.log((df[v_col] + 1) / (df[v_col].shift(1) + 1))
+
+        out[f"{prefix}Log_Dist_SMA20"] = self._compute_sma_log_dist(df, prefix=prefix, window=20)
+        
         return out
 
-    def _compute_interday_log_returns(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Daily close-to-close log return: Log_Return_t = log(C_t / C_{t-1})."""
-        out = pd.DataFrame(index=df.index)
-        out["Log_Return"] = np.log(df["Close"] / df["Close"].shift(1))
-        return out
-
-    def _compute_volume_log_change(self, df: pd.DataFrame) -> pd.Series:
-        """Smoothed volume change: Vol_Change_t = log((V_t + 1) / (V_{t-1} + 1))."""
-        volume = df["Volume"]
-        vol_change = pd.Series(np.log((volume + 1) / (volume.shift(1) + 1)), index=df.index, name="Vol_Change")
-        return vol_change
+    def _compute_sma_log_dist(
+        self, df: pd.DataFrame, prefix: str = "", window: int = 20
+    ) -> pd.Series:
+        """Log ratio of Close relative to SMA: log(Close / SMA_window)."""
+        c_col = f"{prefix}Close"
+        sma = df[c_col].rolling(window=window).mean()
+        return pd.Series(
+            np.log(df[c_col] / sma),
+            index=df.index,
+            name=f"{prefix}Log_Dist_SMA{window}",
+        )
 
     def engineer_features(self) -> pd.DataFrame:
-        """
-        Replace self.clean_df's raw OHLCV columns with log-based features
-        (Log_Return, Open_Close, High_Close, Low_Close, Vol_Change) and the
-        Target_Log_Return target, dropping the NaN rows the shift()-based
-        computations leave at the series' edges.
+        """Engineer log features for primary asset (and cross-asset if enabled),
 
-        Must run after clean() (which supplies the OHLCV df to transform)
-        and before split()/scale()/make_windows(), which now operate on the
-        engineered columns instead of raw OHLCV.
+        and set up the primary target column.
         """
         df = self.clean_df if self.clean_df is not None else self.clean()
 
-        engineered_df = pd.concat([
-            self._compute_interday_log_returns(df),
-            self._compute_intraday_log_ratios(df),
-            self._compute_volume_log_change(df),
-            self._compute_target_log_return(df),
-            df["Close"].rename("Raw_Close"),
-        ], axis=1).dropna()
+        feature_dfs = []
+        feature_cols = []
+
+        is_multi = len(self.raw_df_map) > 1 or self.include_cross_asset
+
+        # Process each ticker present in clean_df
+        for ticker in self.raw_df_map.keys():
+            prefix = f"{ticker}_" if is_multi else ""
+            t_features = self._compute_ticker_features(df, prefix=prefix)
+            feature_dfs.append(t_features)
+            feature_cols.extend(t_features.columns.tolist())
+
+        # Target Log Return (always computed for target_ticker)
+        target_prefix = f"{self.target_ticker}_" if is_multi else ""
+        target_close = df[f"{target_prefix}Close"]
+        target_series = pd.Series(
+            np.log(target_close.shift(-1) / target_close),
+            index=df.index,
+            name="Target_Log_Return",
+        )
+
+        # Base Close price preserved for price reconstruction
+        raw_close_series = target_close.rename("Raw_Close")
+
+        # Optionally also predict each cross-asset ticker's own next-day log
+        # return, alongside the primary target_ticker (multi-target output).
+        extra_target_dfs = []
+        extra_raw_close_dfs = []
+        target_columns: list[str] = ["Target_Log_Return"]
+        target_tickers: list[str] = [self.target_ticker]
+        if self.predict_cross_asset and is_multi:
+            for ticker in self.raw_df_map.keys():
+                if ticker == self.target_ticker:
+                    continue
+                cross_close = df[f"{ticker}_Close"]
+                cross_target_name = f"{ticker}_Target_Log_Return"
+                extra_target_dfs.append(pd.Series(
+                    np.log(cross_close.shift(-1) / cross_close),
+                    index=df.index,
+                    name=cross_target_name,
+                ))
+                extra_raw_close_dfs.append(cross_close.rename(f"{ticker}_Raw_Close"))
+                target_columns.append(cross_target_name)
+                target_tickers.append(ticker)
+
+        engineered_df = pd.concat(
+            [*feature_dfs, target_series, *extra_target_dfs,
+             raw_close_series, *extra_raw_close_dfs], axis=1
+        ).dropna()
 
         self.clean_df = engineered_df
-        self.feature_columns = ["Log_Return", "Open_Close", "High_Close", "Low_Close", "Vol_Change"]
-        self.target_column = "Target_Log_Return"
+        self.feature_columns = feature_cols
+        self.target_column = target_columns if len(target_columns) > 1 else target_columns[0]
+        self.target_tickers = target_tickers
 
         return engineered_df
 
-    def split(self, split_method: str = "date", split_param: str | float = "2023-01-01"):
-        """
-        Split the cleaned data into train/test DataFrames.
-
-        split_method : 'date' (split at a calendar date) or 'ratio' (0-1 float).
-        split_param  : the date string or ratio matching split_method.
-        """
+    def split(
+        self, split_method: str = "date", split_param: str | float = "2023-01-01"
+    ):
+        """Split data into train/test DataFrames."""
         df = self.clean_df
         if df is None:
             df = self.clean()
@@ -218,13 +300,13 @@ class DataHandler:
 
         return train_df, test_df
 
-    def scale(self, train_df: pd.DataFrame, test_df: pd.DataFrame,
-              columns: list[str] | None = None):
-        """
-        MinMax-scale each column to [0, 1], fitting only on train_df to avoid
-        leaking test-period statistics into the scaler. Scalers are stored in
-        self.scalers so predictions can be inverse-transformed later.
-        """
+    def scale(
+        self,
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        columns: list[str] | None = None,
+    ):
+        """MinMax-scale specified columns fitting strictly on train_df."""
         columns = columns or list(train_df.columns)
         train_df, test_df = train_df.copy(), test_df.copy()
 
@@ -238,42 +320,45 @@ class DataHandler:
 
         return train_df, test_df
 
-    def make_windows(self, df: pd.DataFrame, window: int, k: int = 1,
-                      feature_columns: list[str] | None = None,
-                      target_column: str | None = None):
+    def make_windows(
+        self,
+        df: pd.DataFrame,
+        window: int,
+        k: int = 1,
+        feature_columns: list[str] | None = None,
+        target_column: str | list[str] | None = None,
+    ):
         """
-        Slide a `window`-length lookback over df to build supervised-learning
-        (X, y) pairs.
+        Generate (X, y) sliding window sequences.
 
-        window          : number of past trading days fed into the model.
-        k               : number of future days to predict (k=1 -> single-step,
-                           k>1 -> multi-step).
-        feature_columns : columns used as model input (multiple -> multivariate).
-        target_column   : column being predicted. May be one of feature_columns
-                           (e.g. windowing "Close" both as input and target), or
-                           a separate column entirely (e.g. engineer_features()'s
-                           "Target_Log_Return", which isn't itself a model input).
-
-        Shapes returned:
-          X : (n_samples, window, n_features)
-          y : (n_samples,)       if k == 1
-              (n_samples, k)     if k > 1
+        target_column : a single column name (y is 1-D per sample, or 2-D
+                         when k > 1), or a list of column names for
+                         multi-target output (y gains a trailing per-target
+                         axis; if k > 1 too, that 3-D result is flattened to
+                         (n_samples, k * n_targets) to stay Dense-compatible).
         """
         feature_columns = feature_columns or self.feature_columns or list(df.columns)
-        target_column = target_column or self.target_column
+        target_column = target_column if target_column is not None else self.target_column
+        is_multi_target = isinstance(target_column, (list, tuple))
+        target_cols = list(target_column) if is_multi_target else [target_column]
 
         values = df[feature_columns].values
-        if target_column in feature_columns:
+        if not is_multi_target and target_column in feature_columns:
             target_values = values[:, feature_columns.index(target_column)]
         else:
-            target_values = df[target_column].values
+            target_values = df[target_cols].values
+            if not is_multi_target:
+                target_values = target_values[:, 0]
 
         X, y = [], []
         for i in range(window, len(values) - k + 1):
-            X.append(values[i - window:i])
-            y.append(target_values[i] if k == 1 else target_values[i:i + k])
+            X.append(values[i - window : i])
+            y.append(target_values[i] if k == 1 else target_values[i : i + k])
 
-        return np.array(X), np.array(y)
+        X_arr, y_arr = np.array(X), np.array(y)
+        if y_arr.ndim == 3:
+            y_arr = y_arr.reshape(y_arr.shape[0], -1)
+        return X_arr, y_arr
 
     def get_train_test(
         self,
@@ -286,117 +371,84 @@ class DataHandler:
         scale_columns: bool = True,
         use_log_features: bool = True,
         feature_columns: list[str] | None = None,
-        target_column: str | None = None,
+        target_column: str | list[str] | None = None,
     ):
-        """Full pipeline: clean -> [engineer_features] -> split -> scale ->
-
-        window.
-
-        Parameters:
-            window: Number of past days for look-back sequence.
-            k: Number of future steps to predict.
-            split_method: 'date' or 'ratio'.
-            split_param: Cutoff date string or train ratio float (e.g., 0.8).
-            nan_method: Method to handle NaNs ('forward_fill', 'drop', 'mean').
-            fill_gaps: Whether to reindex over full business-day calendar.
-            scale_columns: Whether to MinMax-scale feature columns.
-            use_log_features: If True, computes stationary log features &
-              target.
-            feature_columns: Explicit list of input features (optional).
-            target_column: Explicit target column name (optional).
-
-        Returns:
-            ((X_train, y_train), (X_test, y_test))
-        """
-        # 1. Clean raw OHLCV data
+        """Full pipeline execution."""
         self.clean(nan_method=nan_method, fill_gaps=fill_gaps)
 
-        # 2. Feature engineering choice
         if use_log_features:
             self.engineer_features()
         else:
             if feature_columns is None:
                 self.feature_columns = [
-                    "Open",
-                    "High",
-                    "Low",
-                    "Close",
-                    "Volume",
+                    c for c in self.clean_df.columns if c != "Target_Log_Return"
                 ]
             if target_column is None:
-                self.target_column = "Close"
+                self.target_column = f"{self.target_ticker}_Close" if self.include_cross_asset else "Close"
 
-        # Override explicit feature/target if provided
         if feature_columns is not None:
             self.feature_columns = feature_columns
         if target_column is not None:
             self.target_column = target_column
 
-        # 3. Split dataset into train and test DataFrames
         train_df, test_df = self.split(
             split_method=split_method, split_param=split_param
         )
 
-        # 4. Scale features (Fit ONLY on train_df to prevent data leakage)
         if scale_columns:
             train_df, test_df = self.scale(
                 train_df, test_df, columns=self.feature_columns
             )
 
-        # 5. Prepend context window to test_df so test samples at boundary are not lost
         context_df = train_df.tail(window)
         extended_test_df = pd.concat([context_df, test_df])
 
-        # 6. Preserve unscaled base Close prices (C_t) for test evaluation reconstruction
         if "Raw_Close" in test_df.columns:
             self.raw_close_test = test_df["Raw_Close"].values
-        elif "Close" in test_df.columns:
-            self.raw_close_test = test_df["Close"].values
+        elif f"{self.target_ticker}_Close" in test_df.columns:
+            self.raw_close_test = test_df[f"{self.target_ticker}_Close"].values
 
-        # 7. Generate 3D sequence windows (X, y)
+        self.raw_close_test_map = {}
+        for ticker in self.target_tickers:
+            col = "Raw_Close" if ticker == self.target_ticker else f"{ticker}_Raw_Close"
+            if col in test_df.columns:
+                self.raw_close_test_map[ticker] = np.asarray(test_df[col].values)
+        if self.raw_close_test is not None and self.target_ticker not in self.raw_close_test_map:
+            self.raw_close_test_map[self.target_ticker] = self.raw_close_test
+
         X_train, y_train = self.make_windows(
-            train_df,
-            window,
-            k,
-            self.feature_columns,
-            self.target_column,
+            train_df, window, k, self.feature_columns, self.target_column
         )
         X_test, y_test = self.make_windows(
-            extended_test_df,
-            window,
-            k,
-            self.feature_columns,
-            self.target_column,
+            extended_test_df, window, k, self.feature_columns, self.target_column
         )
 
         return (X_train, y_train), (X_test, y_test)
 
 
 if __name__ == "__main__":
-    # Quick manual test of log-based feature engineering: python data_handler.py
-    downloader = DataDownloader("APPL")
-    csv_path = downloader.download()
-    print(f"CSV ready at: {csv_path}")
+    TARGET_STOCK = "AAPL"
+    CROSS_STOCK = "QQQ"
 
-    handler = DataHandler(csv_path)
-    handler.clean()
-    engineered_df = handler.engineer_features()
+    tickers_to_download = [TARGET_STOCK]
+    if INCLUDE_QQQ_CROSS_ASSET:
+        tickers_to_download.append(CROSS_STOCK)
 
-    (X_train, y_train), (X_test, y_test) = handler.get_train_test(
-        window=60, k=1, split_method="ratio", split_param=0.8
+    downloader = DataDownloader(tickers_to_download)
+    csv_paths = downloader.download()
+
+    handler = DataHandler(
+        csv_input=csv_paths,
+        target_ticker=TARGET_STOCK,
+        include_cross_asset=INCLUDE_QQQ_CROSS_ASSET,
+        predict_cross_asset=PREDICT_CROSS_ASSET,
     )
 
-    feature_columns = handler.feature_columns or []
-    target_column = handler.target_column
-    print(f"feature_columns: {feature_columns}")
-    print(f"target_column:   {target_column}")
-    print("\nEngineered features + target (head):")
-    print(engineered_df[[*feature_columns, target_column]].head())
+    (X_train, y_train), (X_test, y_test) = handler.get_train_test(
+        window=60, k=1, split_method="ratio", split_param=0.8, use_log_features=True
+    )
 
-    print(f"\nX_train: {X_train.shape}, y_train: {y_train.shape}")
-    print(f"X_test:  {X_test.shape}, y_test:  {y_test.shape}")
-
-    has_nan = (np.isnan(X_train).any() or np.isnan(y_train).any()
-               or np.isnan(X_test).any() or np.isnan(y_test).any())
-    print(f"\nNaNs present in X_train/y_train/X_test/y_test: {has_nan}")
-    print(f"Scalers fitted for columns: {list(handler.scalers.keys())}")
+    print(f"\n[DataHandler] Features ({len(handler.feature_columns)}): {handler.feature_columns}")
+    print(f"[DataHandler] Target Column: {handler.target_column}")
+    print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+    print(f"X_test shape:  {X_test.shape}, y_test shape:  {y_test.shape}")

@@ -1,9 +1,8 @@
 # File: main.py
 # Pipeline entry point offering two choices:
-#   1. Pure DL       - LSTM/GRU/RNN trained directly on (scaled) log features.
-#   2. Hybrid        - ARIMA linear component + DL residual model.
+#   1. Pure DL  - LSTM/GRU/RNN trained directly on (scaled) log features.
+#   2. Hybrid   - VARIMAX linear component + DL residual model.
 
-import os
 import os
 
 # Tắt warning một DNN
@@ -11,28 +10,33 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # Tắt các log tin nhắn thông báo của TensorFlow (chỉ hiện Error)
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import numpy as np
 from data import DataDownloader, DataHandler
 from models.dl_model import ModelFactory
-from validation import Validation
-from hybrid_test import HybridTest
+from pure_dl_validation import PureDLValidation
+from hybrid_validation import HybridValidation
 
 # ── Parameters ────────────────────────────────────
 TICKER = "AAPL"
+CROSS_ASSET_TICKER = "QQQ"
 
 # Configuration for Log Features Pipeline
 USE_LOG_FEATURES = True
-PREDICTION_DAYS = 60             # look-back window length
-K_STEPS = 1                      # future days to predict (pure DL only)
+INCLUDE_CROSS_ASSET = True       # Use QQQ as an input feature alongside AAPL
+PREDICT_QQQ_PRICE = True         # Predict both AAPL and QQQ prices simultaneously
+PREDICTION_DAYS = 60             # Look-back window length
+K_STEPS = 1                      # Future days to predict (pure DL only)
 SPLIT_METHOD = "ratio"
 SPLIT_PARAM = 0.8                # 80% train / 20% test
 
-DL_TYPE = "GRU"                 # 'LSTM', 'GRU', or 'RNN'
-NUM_LAYERS = 2
+DL_TYPE = "GRU"                  # 'LSTM', 'GRU', or 'RNN'
+NUM_LAYERS = 3
 UNITS = 64
 DROPOUT_RATE = 0.2
-ARIMA_ORDER = (5, 1, 0)          # (p, d, q) for Hybrid's linear component
+VARIMAX_ORDER = (1, 1)           # (p, q) order for Hybrid's linear VARIMAX component
 
-EPOCHS = 5
+EPOCHS = 50
 BATCH_SIZE = 32
 
 
@@ -40,20 +44,24 @@ def choose_pipeline() -> str:
     """Prompt the user to pick between the pure-DL and Hybrid pipelines."""
     print("Select pipeline:")
     print("  1. Pure DL  - LSTM/GRU/RNN trained directly on features")
-    print("  2. Hybrid   - ARIMA linear component + DL residual model")
+    print("  2. Hybrid   - VARIMAX linear component + DL residual model")
     choice = input("Enter 1 or 2 [default: 1]: ").strip()
     return "hybrid" if choice == "2" else "pure_dl"
 
 
 def run_pure_dl():
     # 1. Download (or reuse cached CSV).
-    downloader = DataDownloader(TICKER)
-    csv_path = downloader.download()
+    tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
+    downloader = DataDownloader(tickers)
+    csv_paths = downloader.download()
 
     # 2. Process data: Clean, Engineer Log Features, Scale, Split, and Window.
-    #    When use_log_features=True, feature_columns and target_column are automatically
-    #    resolved inside DataHandler to the newly generated log features.
-    handler = DataHandler(csv_path)
+    handler = DataHandler(
+        csv_paths,
+        target_ticker=TICKER,
+        include_cross_asset=INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE,
+        predict_cross_asset=PREDICT_QQQ_PRICE,
+    )
     (X_train, y_train), (X_test, y_test) = handler.get_train_test(
         window=PREDICTION_DAYS,
         k=K_STEPS,
@@ -62,18 +70,19 @@ def run_pure_dl():
         scale_columns=True,
         use_log_features=USE_LOG_FEATURES
     )
-    
+
     print(f"[main.py] Features used ({len(handler.feature_columns)}): {handler.feature_columns}")
-    print(f"[main.py] Target column: {handler.target_column}")
+    print(f"[main.py] Target column(s): {handler.target_column}")
     print(f"X_train: {X_train.shape}, y_train: {y_train.shape}")
     print(f"X_test:  {X_test.shape}, y_test:  {y_test.shape}")
 
-    # 3. Build the model via the factory.
+    # 3. Build the model via ModelFactory.
     n_features = X_train.shape[-1]
+    output_dim = y_train.shape[-1] if y_train.ndim > 1 else 1
     dl_model = ModelFactory.get_model(
         DL_TYPE,
         input_shape=(PREDICTION_DAYS, n_features),
-        output_dim=K_STEPS
+        output_dim=output_dim
     )
     dl_model.build_model(num_layers=NUM_LAYERS, units=UNITS, dropout_rate=DROPOUT_RATE)
     dl_model.model.summary()
@@ -85,25 +94,33 @@ def run_pure_dl():
         validation_data=(X_test, y_test) if len(X_test) > 0 else None,
     )
 
-    # 5. Test: Loss curve, convergence stats, log/price accuracy metrics, and price plots.
+    # 5. Evaluate model.
     model_path = os.path.join("trained_models", f"{type(dl_model).__name__}.keras")
-    
-    # Retrieve unscaled base Close prices (C_t) for price reconstruction in Test
-    raw_close_test = handler.raw_close_test
-    
-    tester = Validation(model_path=model_path)
-    tester.run(X_test, y_test, raw_close_today=raw_close_test)
+
+    tester = PureDLValidation(model_path=model_path)
+    tester.run(
+        X_test, y_test,
+        model_info={"input_dim": [PREDICTION_DAYS, n_features], "output_dim": output_dim},
+        target_names=handler.target_tickers,
+        raw_close_map=handler.raw_close_test_map,
+    )
 
 
 def run_hybrid():
     # 1. Download (or reuse cached CSV).
-    downloader = DataDownloader(TICKER)
-    csv_path = downloader.download()
+    tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
+    downloader = DataDownloader(tickers)
+    csv_paths = downloader.download()
 
-    # 2. Clean, engineer log features, split, and scale (fit on train only).
-    handler = DataHandler(csv_path)
+    # 2. Process data: Clean, Engineer Log Features, Split, and Scale.
+    handler = DataHandler(
+        csv_paths,
+        target_ticker=TICKER,
+        include_cross_asset=INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE,
+        predict_cross_asset=PREDICT_QQQ_PRICE,
+    )
     handler.clean()
-    
+
     if USE_LOG_FEATURES:
         handler.engineer_features()
 
@@ -111,24 +128,34 @@ def run_hybrid():
     train_df, test_df = handler.scale(train_df, test_df)
 
     feature_cols = handler.feature_columns
-    target_col = handler.target_column
+    target_cols = handler.target_column if isinstance(handler.target_column, list) else [handler.target_column]
 
-    exog_columns = [c for c in feature_cols if c != target_col]
-    y_train = train_df[target_col].values
-    y_test = test_df[target_col].values
+    exog_columns = [c for c in feature_cols if c not in target_cols]
+    
+    y_train = train_df[target_cols].values
+    y_test = test_df[target_cols].values
     exog_train = train_df[exog_columns].values if exog_columns else None
     exog_test = test_df[exog_columns].values if exog_columns else None
     
-    print(f"y_train: {y_train.shape}, y_test: {y_test.shape}, "
-          f"exog features: {exog_columns if exog_columns else 'none'}")
+    # Flatten to 1D if single target
+    if len(target_cols) == 1:
+        y_train = y_train.squeeze()
+        y_test = y_test.squeeze()
+
+    output_dim = len(target_cols)
+    n_features = output_dim + len(exog_columns)
+
+    print(f"[main.py] Features used ({len(feature_cols)}): {feature_cols}")
+    print(f"[main.py] Target column(s): {target_cols}")
+    print(f"y_train: {y_train.shape}, y_test: {y_test.shape}")
+    print(f"Exog features: {exog_columns if exog_columns else 'none'}")
 
     # 3. Build the Hybrid model via ModelFactory.
-    n_features = 1 + len(exog_columns)
     hybrid = ModelFactory.get_model(
         "hybrid",
         input_shape=(PREDICTION_DAYS, n_features),
-        output_dim=1,
-        arima_order=ARIMA_ORDER,
+        output_dim=output_dim,
+        varimax_order=VARIMAX_ORDER,
         dl_type=DL_TYPE
     )
     hybrid.build_model(num_layers=NUM_LAYERS, units=UNITS, dropout_rate=DROPOUT_RATE)
@@ -141,15 +168,21 @@ def run_hybrid():
         validation_data=(y_test, exog_test),
     )
 
-    # 5. Test Hybrid model.
+    # 5. Evaluate Hybrid model.
     model_path = os.path.join("trained_models", f"{type(hybrid).__name__}.keras")
-    tester = HybridTest(
+    tester = HybridValidation(
         model_path=model_path,
         input_shape=(PREDICTION_DAYS, n_features),
-        arima_order=ARIMA_ORDER,
-        dl_type=DL_TYPE
+        output_dim=output_dim,
+        varimax_order=VARIMAX_ORDER,
+        dl_type=DL_TYPE,
     )
-    tester.run(y_test, exog_test)
+    tester.run(
+        y_test, exog_test,
+        target_names=handler.target_tickers,
+        raw_close_map=handler.raw_close_test_map,
+        model_info={"input_dim": [PREDICTION_DAYS, n_features], "output_dim": output_dim},
+    )
 
 
 def main():

@@ -1,4 +1,4 @@
-# File: test.py
+# File: validation.py
 # Task C.4 evaluation: loads a trained Pure DL model (+ its saved training history)
 # and evaluates it against a held-out test set.
 # Handles log-return predictions by inverse-transforming them to actual price values
@@ -7,7 +7,7 @@
 import json
 import os
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -18,7 +18,7 @@ RESULTS_DIR = "results"
 HISTORY_DIR = "history"
 
 
-class Validation:
+class PureDLValidation:
     """
     Evaluates an already-trained Keras model against a test set.
 
@@ -117,73 +117,100 @@ class Validation:
         """
         return raw_close_today * np.exp(y_log)
 
-    def accuracy_metrics(self, X_test: np.ndarray, y_test: np.ndarray,
-                         raw_close_today: np.ndarray | None = None) -> Tuple[dict, np.ndarray | None, np.ndarray | None]:
+    def accuracy_metrics(
+        self, X_test: np.ndarray, y_test: np.ndarray,
+        target_names: Optional[list] = None,
+        raw_close_map: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Tuple[Dict[str, dict], Dict[str, Tuple[Optional[np.ndarray], Optional[np.ndarray]]]]:
         """
-        Evaluate model accuracy on both log returns and reconstructed prices.
+        Evaluate model accuracy on both log returns and reconstructed prices,
+        reported separately per prediction target (e.g. AAPL vs QQQ) instead
+        of blended together.
 
         Parameters:
             X_test: Input sequence windows.
-            y_test: Actual target log returns.
-            raw_close_today: Unscaled Close price at time t (last step in input window).
+            y_test: Actual target log returns; 1-D (single target) or 2-D
+                    (n_samples, n_targets) when predicting multiple assets.
+            target_names: Label for each column of y_test, e.g. ["AAPL", "QQQ"].
+                          Defaults to ["Target"] for a single target.
+            raw_close_map: {target_name: unscaled Close price at time t},
+                           used to reconstruct actual prices for that target.
+                           A target with no entry only gets log-space metrics.
 
         Returns:
-            Tuple of (metrics dict, reconstructed actual prices, reconstructed predicted prices).
+            (per_target metrics dict keyed by target name,
+             per_target (c_true, c_pred) reconstructed price arrays)
         """
         y_pred_log = self.predict(X_test)
         y_true_log = np.asarray(y_test)
         y_pred_log = y_pred_log.reshape(y_true_log.shape)
 
-        # 1. Log-space metrics
-        log_errors = y_pred_log - y_true_log
-        log_rmse = float(np.sqrt(np.mean(log_errors ** 2)))
-        log_mae = float(np.mean(np.abs(log_errors)))
+        if y_true_log.ndim == 1:
+            y_true_log = y_true_log[:, None]
+            y_pred_log = y_pred_log[:, None]
+        n_targets = y_true_log.shape[-1]
 
-        # 2. Directional Accuracy (Sign matching on log return)
-        # y_t > 0 means price increase, y_t < 0 means price decrease
-        first_step_true = y_true_log[:, 0] if y_true_log.ndim > 1 else y_true_log
-        first_step_pred = y_pred_log[:, 0] if y_pred_log.ndim > 1 else y_pred_log
-        correct_direction = np.sign(first_step_pred) == np.sign(first_step_true)
-        directional_accuracy = float(np.mean(correct_direction)) * 100
+        if not target_names or len(target_names) != n_targets:
+            target_names = ["Target"] if n_targets == 1 else [f"Target_{i}" for i in range(n_targets)]
 
-        metrics = {
-            "Log_RMSE": log_rmse,
-            "Log_MAE": log_mae,
-            "Directional Accuracy (%)": directional_accuracy,
-        }
+        raw_close_map = raw_close_map or {}
+        per_target_metrics: Dict[str, dict] = {}
+        per_target_prices: Dict[str, Tuple[Optional[np.ndarray], Optional[np.ndarray]]] = {}
 
-        # 3. Price-space metrics (if raw_close_today is provided)
-        c_true_next, c_pred_next = None, None
-        if raw_close_today is not None:
-            raw_close_today = raw_close_today[:len(first_step_true)]
-            c_true_next = self._reconstruct_price(first_step_true, raw_close_today)
-            c_pred_next = self._reconstruct_price(first_step_pred, raw_close_today)
+        for i, name in enumerate(target_names):
+            true_i = y_true_log[:, i]
+            pred_i = y_pred_log[:, i]
 
-            price_errors = c_pred_next - c_true_next
-            price_rmse = float(np.sqrt(np.mean(price_errors ** 2)))
-            price_mae = float(np.mean(np.abs(price_errors)))
-            nonzero = c_true_next != 0
-            price_mape = float(np.mean(np.abs(price_errors[nonzero] / c_true_next[nonzero])) * 100) if nonzero.any() else float("nan")
+            log_errors = pred_i - true_i
+            log_rmse = float(np.sqrt(np.mean(log_errors ** 2)))
+            log_mae = float(np.mean(np.abs(log_errors)))
 
-            metrics.update({
-                "Price_RMSE": price_rmse,
-                "Price_MAE": price_mae,
-                "Price_MAPE (%)": price_mape,
-            })
+            correct_direction = np.sign(pred_i) == np.sign(true_i)
+            directional_accuracy = float(np.mean(correct_direction)) * 100
 
-        print("[Test] Predictive accuracy:")
-        for k, v in metrics.items():
-            print(f"  {k}: {v:.4f}")
+            metrics = {
+                "Log_RMSE": log_rmse,
+                "Log_MAE": log_mae,
+                "Directional Accuracy (%)": directional_accuracy,
+            }
 
-        return metrics, c_true_next, c_pred_next
+            c_true, c_pred = None, None
+            raw_close_today = raw_close_map.get(name)
+            if raw_close_today is not None:
+                raw_close_today = raw_close_today[:len(true_i)]
+                c_true = self._reconstruct_price(true_i, raw_close_today)
+                c_pred = self._reconstruct_price(pred_i, raw_close_today)
+
+                price_errors = c_pred - c_true
+                price_rmse = float(np.sqrt(np.mean(price_errors ** 2)))
+                price_mae = float(np.mean(np.abs(price_errors)))
+                nonzero = c_true != 0
+                price_mape = float(np.mean(np.abs(price_errors[nonzero] / c_true[nonzero])) * 100) if nonzero.any() else float("nan")
+
+                metrics.update({
+                    "Price_RMSE": price_rmse,
+                    "Price_MAE": price_mae,
+                    "Price_MAPE (%)": price_mape,
+                })
+
+            print(f"[Test] Predictive accuracy ({name}):")
+            for k, v in metrics.items():
+                print(f"  {k}: {v:.4f}")
+
+            per_target_metrics[name] = metrics
+            per_target_prices[name] = (c_true, c_pred)
+
+        return per_target_metrics, per_target_prices
 
     def plot_predictions(self, c_true: np.ndarray, c_pred: np.ndarray,
-                         filename: str = "predictions.png") -> str:
-        """Plot actual vs predicted prices over the test set."""
+                         stock_name: str = "", filename: str = "predictions.png") -> str:
+        """Plot actual vs predicted prices for one target over the test set."""
         fig, ax = plt.subplots(figsize=(12, 5))
         ax.plot(c_true, color="black", label="Actual Price")
         ax.plot(c_pred, color="green", label="Predicted Price")
-        ax.set_title("Actual vs Predicted Price (Test Set)")
+        title = f"Actual vs Predicted Price - {stock_name} (Test Set)" if stock_name \
+            else "Actual vs Predicted Price (Test Set)"
+        ax.set_title(title)
         ax.set_xlabel("Test Sample")
         ax.set_ylabel("Price")
         ax.legend()
@@ -192,10 +219,11 @@ class Validation:
         save_path = os.path.join(self.plots_dir, filename)
         fig.savefig(save_path)
         plt.close(fig)
-        print(f"[Test] Prediction plot saved to {save_path}")
+        print(f"[Test] Prediction plot for {stock_name or 'target'} saved to {save_path}")
         return save_path
 
-    def save_results(self, results: dict, filename: Optional[str] = None) -> str:
+    def save_results(self, results: dict, filename: Optional[str] = None,
+                      model_info: Optional[dict] = None) -> str:
         """Save evaluation results as timestamped JSON."""
         if filename is None:
             model_name = os.path.splitext(os.path.basename(self.model_path))[0]
@@ -206,6 +234,7 @@ class Validation:
         payload = {
             "model_path": self.model_path,
             "timestamp": datetime.now().isoformat(),
+            **(model_info or {}),
             **results,
         }
         with open(save_path, "w") as f:
@@ -214,17 +243,42 @@ class Validation:
         return save_path
 
     def run(self, X_test: np.ndarray, y_test: np.ndarray,
-            raw_close_today: np.ndarray | None = None) -> dict:
-        """Run full evaluation suite."""
+            raw_close_today: np.ndarray | None = None,
+            model_info: Optional[dict] = None,
+            target_names: Optional[list] = None,
+            raw_close_map: Optional[Dict[str, np.ndarray]] = None) -> dict:
+        """
+        Run full evaluation suite, reporting metrics and plots separately per
+        prediction target (e.g. AAPL vs QQQ) when the model predicts more than one.
+
+        model_info : optional extra fields to log alongside the results, e.g.
+                     {"input_dim": (window, n_features), "output_dim": k_steps}.
+        target_names : label per target column of y_test, e.g. ["AAPL", "QQQ"].
+                       Defaults to ["Target"] for a single-target model.
+        raw_close_map : {target_name: raw close array}, used for price
+                        reconstruction/plots. raw_close_today is a shorthand
+                        for the single-target case and is folded into this
+                        map under the first target_names entry if given.
+        """
         self.plot_loss_curve()
         convergence = self.convergence_stats()
-        metrics, c_true, c_pred = self.accuracy_metrics(X_test, y_test, raw_close_today)
 
-        if c_true is not None and c_pred is not None:
-            self.plot_predictions(c_true, c_pred)
+        if raw_close_map is None and raw_close_today is not None:
+            primary_name = (target_names or ["Target"])[0]
+            raw_close_map = {primary_name: raw_close_today}
 
-        results = {"convergence": convergence, "accuracy": metrics}
-        self.save_results(results)
+        per_target_metrics, per_target_prices = self.accuracy_metrics(
+            X_test, y_test, target_names=target_names, raw_close_map=raw_close_map
+        )
+
+        for name, (c_true, c_pred) in per_target_prices.items():
+            if c_true is not None and c_pred is not None:
+                safe_name = name.replace(" ", "_")
+                self.plot_predictions(c_true, c_pred, stock_name=name,
+                                       filename=f"predictions_{safe_name}.png")
+
+        results = {"convergence": convergence, "accuracy": per_target_metrics}
+        self.save_results(results, model_info=model_info)
         return results
 
 
@@ -247,5 +301,5 @@ if __name__ == "__main__":
     # Retrieve raw close price array for price reconstruction
     raw_close_test = handler.raw_close_test
 
-    tester = Validation(model_path=os.path.join("models", "LSTMModel.keras"))
+    tester = PureDLValidation(model_path=os.path.join("models", "LSTMModel.keras"))
     tester.run(X_test, y_test, raw_close_today=raw_close_test)
