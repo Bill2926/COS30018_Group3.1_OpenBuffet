@@ -3,6 +3,7 @@
 #   1. Pure DL  - LSTM/GRU/RNN trained directly on (scaled) log features.
 #   2. Hybrid   - VARIMAX linear component + DL residual model.
 
+import argparse
 import os
 
 # Tắt warning một DNN
@@ -25,34 +26,43 @@ CROSS_ASSET_TICKER = "QQQ"
 USE_LOG_FEATURES = True
 INCLUDE_CROSS_ASSET = True       # Use QQQ as an input feature alongside AAPL
 PREDICT_QQQ_PRICE = True         # Predict both AAPL and QQQ prices simultaneously
-PREDICTION_DAYS = 60             # Look-back window length
+PREDICTION_DAYS = 30             # Look-back window length
 K_STEPS = 1                      # Future days to predict (pure DL only)
 SPLIT_METHOD = "ratio"
 SPLIT_PARAM = 0.8                # 80% train / 20% test
 
 DL_TYPE = "GRU"                  # 'LSTM', 'GRU', or 'RNN'
-NUM_LAYERS = 3
-UNITS = 64
-DROPOUT_RATE = 0.2
+NUM_LAYERS = 2
+UNITS = (32,16)            # int (same width every layer) or a tuple with one entry per layer, last = final layer
+DROPOUT_RATE = 0.1
 VARIMAX_ORDER = (1, 1)           # (p, q) order for Hybrid's linear VARIMAX component
 
 EPOCHS = 50
 BATCH_SIZE = 32
 
+START_DATE = "23-07-2012"
+END_DATE = "27-01-2020"
+SENTIMENT_PATH = "sentiments/aapl_sen_23-07-2012_27-01-2020"    # Currently only support AAPL
+USE_SENTIMENT = True
+
+USE_TDA = True    # Add rolling Persistent Entropy (tda.py) as an extra feature; window matches PREDICTION_DAYS below
+
 
 def choose_pipeline() -> str:
-    """Prompt the user to pick between the pure-DL and Hybrid pipelines."""
-    print("Select pipeline:")
-    print("  1. Pure DL  - LSTM/GRU/RNN trained directly on features")
-    print("  2. Hybrid   - VARIMAX linear component + DL residual model")
-    choice = input("Enter 1 or 2 [default: 1]: ").strip()
-    return "hybrid" if choice == "2" else "pure_dl"
+    """Pick between the pure-DL and Hybrid pipelines via --mode (1=Pure DL, 2=Hybrid; default 1)."""
+    parser = argparse.ArgumentParser(description="Run the Pure DL or Hybrid stock prediction pipeline.")
+    parser.add_argument(
+        "--mode", type=int, choices=[1, 2], default=1,
+        help="1 = Pure DL (LSTM/GRU/RNN on features), 2 = Hybrid (VARIMAX + DL residual). Default: 1.",
+    )
+    args = parser.parse_args()
+    return "hybrid" if args.mode == 2 else "pure_dl"
 
 
 def run_pure_dl():
     # 1. Download (or reuse cached CSV).
     tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
-    downloader = DataDownloader(tickers)
+    downloader = DataDownloader(tickers, START_DATE, END_DATE)
     csv_paths = downloader.download()
 
     # 2. Process data: Clean, Engineer Log Features, Scale, Split, and Window.
@@ -61,6 +71,10 @@ def run_pure_dl():
         target_ticker=TICKER,
         include_cross_asset=INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE,
         predict_cross_asset=PREDICT_QQQ_PRICE,
+        use_sentiment=USE_SENTIMENT,
+        sentiment_path=SENTIMENT_PATH,
+        use_tda=USE_TDA,
+        tda_window_size=PREDICTION_DAYS,
     )
     (X_train, y_train), (X_test, y_test) = handler.get_train_test(
         window=PREDICTION_DAYS,
@@ -100,7 +114,11 @@ def run_pure_dl():
     tester = PureDLValidation(model_path=model_path)
     tester.run(
         X_test, y_test,
-        model_info={"input_dim": [PREDICTION_DAYS, n_features], "output_dim": output_dim},
+        model_info={
+            "input_dim": [PREDICTION_DAYS, n_features],
+            "output_dim": output_dim,
+            "use_sentiment": USE_SENTIMENT,
+        },
         target_names=handler.target_tickers,
         raw_close_map=handler.raw_close_test_map,
     )
@@ -109,7 +127,7 @@ def run_pure_dl():
 def run_hybrid():
     # 1. Download (or reuse cached CSV).
     tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
-    downloader = DataDownloader(tickers)
+    downloader = DataDownloader(tickers, start_date=START_DATE, end_date=END_DATE)
     csv_paths = downloader.download()
 
     # 2. Process data: Clean, Engineer Log Features, Split, and Scale.
@@ -118,6 +136,10 @@ def run_hybrid():
         target_ticker=TICKER,
         include_cross_asset=INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE,
         predict_cross_asset=PREDICT_QQQ_PRICE,
+        use_sentiment=USE_SENTIMENT,
+        sentiment_path=SENTIMENT_PATH,
+        use_tda=USE_TDA,
+        tda_window_size=PREDICTION_DAYS,
     )
     handler.clean()
 

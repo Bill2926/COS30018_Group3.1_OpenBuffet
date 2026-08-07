@@ -108,6 +108,10 @@ class DataHandler:
         target_column: str | list[str] | None = None,
         include_cross_asset: bool = INCLUDE_QQQ_CROSS_ASSET,
         predict_cross_asset: bool = PREDICT_CROSS_ASSET,
+        use_sentiment: bool = False,
+        sentiment_path: str | None = None,
+        use_tda: bool = False,
+        tda_window_size: int = 30,
     ):
         """Parameters:
 
@@ -118,6 +122,19 @@ class DataHandler:
         own next-day log return (multi-target output), on top of the primary
         target_ticker. Only takes effect when include_cross_asset is True and
         more than one ticker is loaded; ignored otherwise.
+        use_sentiment: Flag to join a daily news-sentiment score (from
+        sentiment_path) onto the target_ticker's dates and add it as an
+        extra input feature. Pure-DL pipeline only, ignored by Hybrid.
+        sentiment_path: CSV path with "Date"/"sentiment_score" columns
+        (".csv" appended automatically if the given path lacks it). Required
+        when use_sentiment is True.
+        use_tda: Flag to add a rolling Persistent Entropy feature
+        ("tda_entropy", see tda.py) computed on target_ticker's raw Close
+        price. Compatible with both the Pure-DL and Hybrid pipelines.
+        tda_window_size: Trailing window length (in rows) for the rolling
+        Persistent Entropy computation; should match the model's look-back
+        window (PREDICTION_DAYS) so the topological feature covers the same
+        horizon as the rest of the input sequence.
         """
         if isinstance(csv_input, str):
             self.csv_map = {target_ticker: csv_input}
@@ -127,6 +144,10 @@ class DataHandler:
         self.target_ticker = target_ticker
         self.include_cross_asset = include_cross_asset
         self.predict_cross_asset = predict_cross_asset
+        self.use_sentiment = use_sentiment
+        self.sentiment_path = sentiment_path
+        self.use_tda = use_tda
+        self.tda_window_size = tda_window_size
         self.feature_columns = feature_columns
         self.target_column = target_column
 
@@ -215,6 +236,21 @@ class DataHandler:
             name=f"{prefix}Log_Dist_SMA{window}",
         )
 
+    def _load_sentiment(self) -> pd.DataFrame:
+        """
+        Load the daily sentiment CSV (columns: Date, sentiment_score, ...)
+        indexed by Date, ready to be joined onto the target_ticker's trading
+        days. sentiment_path may be given with or without the ".csv" suffix.
+        """
+        if not self.sentiment_path:
+            raise ValueError("use_sentiment=True requires sentiment_path to be set.")
+        path = self.sentiment_path
+        if not os.path.exists(path) and os.path.exists(f"{path}.csv"):
+            path = f"{path}.csv"
+
+        df = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
+        return df[["sentiment_score"]].rename(columns={"sentiment_score": "Sentiment_Score"})
+
     def engineer_features(self) -> pd.DataFrame:
         """Engineer log features for primary asset (and cross-asset if enabled),
 
@@ -271,6 +307,31 @@ class DataHandler:
             [*feature_dfs, target_series, *extra_target_dfs,
              raw_close_series, *extra_raw_close_dfs], axis=1
         ).dropna()
+
+        # Optionally join daily news sentiment onto target_ticker's trading
+        # days as one extra feature. Joined (and NaN-filled) after the
+        # price-based dropna() above, since sentiment coverage gaps
+        # (e.g. weekends already excluded, or missing news days) shouldn't
+        # drop otherwise-valid price rows.
+        if self.use_sentiment:
+            sentiment_df = self._load_sentiment()
+            engineered_df = engineered_df.join(sentiment_df, how="left")
+            engineered_df["Sentiment_Score"] = engineered_df["Sentiment_Score"].ffill().fillna(0.0)
+            feature_cols.append("Sentiment_Score")
+
+        # Optionally add a rolling Topological Data Analysis (Persistent
+        # Entropy) feature on target_ticker's raw Close price. Computed on
+        # the full (pre-dropna) price history so early rows still get a
+        # real trailing window, then aligned back onto engineered_df's
+        # (post-dropna) index - same pattern as the sentiment join above.
+        if self.use_tda:
+            from tda import extract_tda_features
+            tda_series = extract_tda_features(
+                df, price_col=f"{target_prefix}Close", window_size=self.tda_window_size
+            )
+            engineered_df["tda_entropy"] = tda_series.reindex(engineered_df.index)
+            engineered_df["tda_entropy"] = engineered_df["tda_entropy"].ffill().fillna(0.0)
+            feature_cols.append("tda_entropy")
 
         self.clean_df = engineered_df
         self.feature_columns = feature_cols
@@ -424,31 +485,3 @@ class DataHandler:
         )
 
         return (X_train, y_train), (X_test, y_test)
-
-
-if __name__ == "__main__":
-    TARGET_STOCK = "AAPL"
-    CROSS_STOCK = "QQQ"
-
-    tickers_to_download = [TARGET_STOCK]
-    if INCLUDE_QQQ_CROSS_ASSET:
-        tickers_to_download.append(CROSS_STOCK)
-
-    downloader = DataDownloader(tickers_to_download)
-    csv_paths = downloader.download()
-
-    handler = DataHandler(
-        csv_input=csv_paths,
-        target_ticker=TARGET_STOCK,
-        include_cross_asset=INCLUDE_QQQ_CROSS_ASSET,
-        predict_cross_asset=PREDICT_CROSS_ASSET,
-    )
-
-    (X_train, y_train), (X_test, y_test) = handler.get_train_test(
-        window=60, k=1, split_method="ratio", split_param=0.8, use_log_features=True
-    )
-
-    print(f"\n[DataHandler] Features ({len(handler.feature_columns)}): {handler.feature_columns}")
-    print(f"[DataHandler] Target Column: {handler.target_column}")
-    print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
-    print(f"X_test shape:  {X_test.shape}, y_test shape:  {y_test.shape}")
