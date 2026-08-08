@@ -299,7 +299,8 @@ class HybridValidation:
     def run(self, y_test: np.ndarray, exog_test: Optional[np.ndarray] = None,
             target_names: Optional[list] = None,
             raw_close_map: Optional[Dict[str, np.ndarray]] = None,
-            model_info: Optional[dict] = None) -> dict:
+            model_info: Optional[dict] = None,
+            results_filename: Optional[str] = None) -> dict:
         """
         Run the complete evaluation suite across all targets, log metrics,
         save results, and generate decomposition plots.
@@ -315,7 +316,7 @@ class HybridValidation:
         self.plot_components(eval_result, target_names=target_names)
 
         results = {"convergence": convergence, "accuracy": per_target_metrics}
-        self.save_results(results, model_info=model_info)
+        self.save_results(results, filename=results_filename, model_info=model_info)
         return results
 
 

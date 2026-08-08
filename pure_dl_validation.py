@@ -246,7 +246,8 @@ class PureDLValidation:
             raw_close_today: np.ndarray | None = None,
             model_info: Optional[dict] = None,
             target_names: Optional[list] = None,
-            raw_close_map: Optional[Dict[str, np.ndarray]] = None) -> dict:
+            raw_close_map: Optional[Dict[str, np.ndarray]] = None,
+            results_filename: Optional[str] = None) -> dict:
         """
         Run full evaluation suite, reporting metrics and plots separately per
         prediction target (e.g. AAPL vs QQQ) when the model predicts more than one.
@@ -278,7 +279,7 @@ class PureDLValidation:
                                        filename=f"predictions_{safe_name}.png")
 
         results = {"convergence": convergence, "accuracy": per_target_metrics}
-        self.save_results(results, model_info=model_info)
+        self.save_results(results, filename=results_filename, model_info=model_info)
         return results
 
 

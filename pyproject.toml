@@ -52,6 +52,7 @@ dependencies = [
     "requests==2.34.2",
     "requests-html>=0.10.0",
     "rich==15.0.0",
+    "ripser==0.6.15",
     "scikit-learn==1.8.0",
     "scipy==1.17.1",
     "setuptools==82.0.1",

@@ -24,14 +24,12 @@ CROSS_ASSET_TICKER = "QQQ"
 
 # Configuration for Log Features Pipeline
 USE_LOG_FEATURES = True
-INCLUDE_CROSS_ASSET = True       # Use QQQ as an input feature alongside AAPL
-PREDICT_QQQ_PRICE = True         # Predict both AAPL and QQQ prices simultaneously
 PREDICTION_DAYS = 30             # Look-back window length
 K_STEPS = 1                      # Future days to predict (pure DL only)
 SPLIT_METHOD = "ratio"
 SPLIT_PARAM = 0.8                # 80% train / 20% test
 
-DL_TYPE = "GRU"                  # 'LSTM', 'GRU', or 'RNN'
+DL_TYPE = "LSTM"                  # 'LSTM', 'GRU', or 'RNN'
 NUM_LAYERS = 2
 UNITS = (32,16)            # int (same width every layer) or a tuple with one entry per layer, last = final layer
 DROPOUT_RATE = 0.1
@@ -42,10 +40,19 @@ BATCH_SIZE = 32
 
 START_DATE = "23-07-2012"
 END_DATE = "27-01-2020"
-SENTIMENT_PATH = "sentiments/aapl_sen_23-07-2012_27-01-2020"    # Currently only support AAPL
-USE_SENTIMENT = True
 
+# Cross asset
+INCLUDE_CROSS_ASSET = True       # Use QQQ as an input feature alongside AAPL
+PREDICT_QQQ_PRICE = True         # Predict both AAPL and QQQ prices simultaneously
+
+# Sentiment
+USE_SENTIMENT = True
+SENTIMENT_PATH = "sentiments/aapl_sen_23-07-2012_27-01-2020"    # Currently only support AAPL
+
+# TDA and ^VIX score
 USE_TDA = True    # Add rolling Persistent Entropy (tda.py) as an extra feature; window matches PREDICTION_DAYS below
+VIX_TICKER = "^VIX"
+USE_VIX = True    # Add CBOE Volatility Index (VIX) daily close, fetched via yfinance, as an extra feature
 
 
 def choose_pipeline() -> str:
@@ -59,11 +66,16 @@ def choose_pipeline() -> str:
     return "hybrid" if args.mode == 2 else "pure_dl"
 
 
-def run_pure_dl():
+def run_pure_dl(plots_dir: str = "plots", results_dir: str = "results",
+                 results_filename: str | None = None):
     # 1. Download (or reuse cached CSV).
     tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
     downloader = DataDownloader(tickers, START_DATE, END_DATE)
     csv_paths = downloader.download()
+
+    vix_csv_path = None
+    if USE_VIX:
+        vix_csv_path = DataDownloader(VIX_TICKER, START_DATE, END_DATE).download_ticker(VIX_TICKER)
 
     # 2. Process data: Clean, Engineer Log Features, Scale, Split, and Window.
     handler = DataHandler(
@@ -75,6 +87,8 @@ def run_pure_dl():
         sentiment_path=SENTIMENT_PATH,
         use_tda=USE_TDA,
         tda_window_size=PREDICTION_DAYS,
+        use_vix=USE_VIX,
+        vix_csv_path=vix_csv_path,
     )
     (X_train, y_train), (X_test, y_test) = handler.get_train_test(
         window=PREDICTION_DAYS,
@@ -111,24 +125,35 @@ def run_pure_dl():
     # 5. Evaluate model.
     model_path = os.path.join("trained_models", f"{type(dl_model).__name__}.keras")
 
-    tester = PureDLValidation(model_path=model_path)
-    tester.run(
+    tester = PureDLValidation(model_path=model_path, plots_dir=plots_dir, results_dir=results_dir)
+    return tester.run(
         X_test, y_test,
         model_info={
+            "mode": "Pure_DL",
+            "model_type": DL_TYPE,
+            "include_cross_asset": INCLUDE_CROSS_ASSET,
+            "use_sentiment": USE_SENTIMENT,
+            "use_tda": USE_TDA,
+            "use_vix": USE_VIX,
             "input_dim": [PREDICTION_DAYS, n_features],
             "output_dim": output_dim,
-            "use_sentiment": USE_SENTIMENT,
         },
         target_names=handler.target_tickers,
         raw_close_map=handler.raw_close_test_map,
+        results_filename=results_filename,
     )
 
 
-def run_hybrid():
+def run_hybrid(plots_dir: str = "plots", results_dir: str = "results",
+                results_filename: str | None = None):
     # 1. Download (or reuse cached CSV).
     tickers = [TICKER, CROSS_ASSET_TICKER] if (INCLUDE_CROSS_ASSET or PREDICT_QQQ_PRICE) else [TICKER]
     downloader = DataDownloader(tickers, start_date=START_DATE, end_date=END_DATE)
     csv_paths = downloader.download()
+
+    vix_csv_path = None
+    if USE_VIX:
+        vix_csv_path = DataDownloader(VIX_TICKER, START_DATE, END_DATE).download_ticker(VIX_TICKER)
 
     # 2. Process data: Clean, Engineer Log Features, Split, and Scale.
     handler = DataHandler(
@@ -140,6 +165,8 @@ def run_hybrid():
         sentiment_path=SENTIMENT_PATH,
         use_tda=USE_TDA,
         tda_window_size=PREDICTION_DAYS,
+        use_vix=USE_VIX,
+        vix_csv_path=vix_csv_path,
     )
     handler.clean()
 
@@ -148,6 +175,16 @@ def run_hybrid():
 
     train_df, test_df = handler.split(split_method=SPLIT_METHOD, split_param=SPLIT_PARAM)
     train_df, test_df = handler.scale(train_df, test_df)
+
+    # get_train_test() (used by run_pure_dl) populates raw_close_test_map as a
+    # side effect; run_hybrid() drives clean/engineer_features/split/scale
+    # directly instead, so it must fill this in itself for price-space
+    # metrics (reconstructed via C_t * exp(y_t)) to be available below.
+    handler.raw_close_test_map = {}
+    for ticker in handler.target_tickers:
+        col = "Raw_Close" if ticker == TICKER else f"{ticker}_Raw_Close"
+        if col in test_df.columns:
+            handler.raw_close_test_map[ticker] = np.asarray(test_df[col].values)
 
     feature_cols = handler.feature_columns
     target_cols = handler.target_column if isinstance(handler.target_column, list) else [handler.target_column]
@@ -198,12 +235,24 @@ def run_hybrid():
         output_dim=output_dim,
         varimax_order=VARIMAX_ORDER,
         dl_type=DL_TYPE,
+        plots_dir=plots_dir,
+        results_dir=results_dir,
     )
-    tester.run(
+    return tester.run(
         y_test, exog_test,
         target_names=handler.target_tickers,
         raw_close_map=handler.raw_close_test_map,
-        model_info={"input_dim": [PREDICTION_DAYS, n_features], "output_dim": output_dim},
+        model_info={
+            "mode": "Hybrid",
+            "model_type": f"VARMAX+{DL_TYPE}",
+            "include_cross_asset": INCLUDE_CROSS_ASSET,
+            "use_sentiment": USE_SENTIMENT,
+            "use_tda": USE_TDA,
+            "use_vix": USE_VIX,
+            "input_dim": [PREDICTION_DAYS, n_features],
+            "output_dim": output_dim,
+        },
+        results_filename=results_filename,
     )
 
 

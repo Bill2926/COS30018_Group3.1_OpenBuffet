@@ -112,6 +112,8 @@ class DataHandler:
         sentiment_path: str | None = None,
         use_tda: bool = False,
         tda_window_size: int = 30,
+        use_vix: bool = False,
+        vix_csv_path: str | None = None,
     ):
         """Parameters:
 
@@ -135,6 +137,13 @@ class DataHandler:
         Persistent Entropy computation; should match the model's look-back
         window (PREDICTION_DAYS) so the topological feature covers the same
         horizon as the rest of the input sequence.
+        use_vix: Flag to join the CBOE Volatility Index (VIX) daily close
+        onto the target_ticker's dates and add it as an extra input
+        feature ("VIX_Close"). Compatible with both the Pure-DL and Hybrid
+        pipelines.
+        vix_csv_path: CSV path (as produced by DataDownloader for the
+        "^VIX" ticker) with a "Close" column indexed by Date. Required
+        when use_vix is True.
         """
         if isinstance(csv_input, str):
             self.csv_map = {target_ticker: csv_input}
@@ -148,6 +157,8 @@ class DataHandler:
         self.sentiment_path = sentiment_path
         self.use_tda = use_tda
         self.tda_window_size = tda_window_size
+        self.use_vix = use_vix
+        self.vix_csv_path = vix_csv_path
         self.feature_columns = feature_columns
         self.target_column = target_column
 
@@ -251,6 +262,18 @@ class DataHandler:
         df = pd.read_csv(path, parse_dates=["Date"], index_col="Date")
         return df[["sentiment_score"]].rename(columns={"sentiment_score": "Sentiment_Score"})
 
+    def _load_vix(self) -> pd.DataFrame:
+        """
+        Load the VIX daily close (from a DataDownloader-produced CSV for the
+        "^VIX" ticker) indexed by Date, ready to be joined onto the
+        target_ticker's trading days.
+        """
+        if not self.vix_csv_path:
+            raise ValueError("use_vix=True requires vix_csv_path to be set.")
+
+        df = pd.read_csv(self.vix_csv_path, index_col=0, parse_dates=True)
+        return df[["Close"]].rename(columns={"Close": "VIX_Close"})
+
     def engineer_features(self) -> pd.DataFrame:
         """Engineer log features for primary asset (and cross-asset if enabled),
 
@@ -332,6 +355,15 @@ class DataHandler:
             engineered_df["tda_entropy"] = tda_series.reindex(engineered_df.index)
             engineered_df["tda_entropy"] = engineered_df["tda_entropy"].ffill().fillna(0.0)
             feature_cols.append("tda_entropy")
+
+        # Optionally join the CBOE Volatility Index (VIX) daily close onto
+        # target_ticker's trading days as one extra feature. Same
+        # left-join + ffill pattern as the sentiment/TDA features above.
+        if self.use_vix:
+            vix_df = self._load_vix()
+            engineered_df = engineered_df.join(vix_df, how="left")
+            engineered_df["VIX_Close"] = engineered_df["VIX_Close"].ffill().fillna(0.0)
+            feature_cols.append("VIX_Close")
 
         self.clean_df = engineered_df
         self.feature_columns = feature_cols
